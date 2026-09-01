@@ -1,0 +1,1000 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Quality Dashboard - nightly QA/security ingestion, normalisation and
+  release-gate evaluation platform (app-79dad50c-0e543650).
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: app-79dad50c-0e543650
+  PermissionsBoundaryArn:
+    Type: String
+    Default: arn:aws:iam::544635841962:policy/brd-architect-deploy-boundary
+  VpcId:
+    Type: String
+    Default: vpc-01d3b02b0f1c07aa0
+  PublicSubnetIds:
+    Type: CommaDelimitedList
+    Default: subnet-0f43b5569d97d4bda,subnet-0f0834e47e6db3a6d,subnet-07a510b42806744f0
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    CodeUri: src/
+    Environment:
+      Variables:
+        DB_HOST: !GetAtt DbInstance.Endpoint.Address
+        DB_PORT: !GetAtt DbInstance.Endpoint.Port
+        DB_NAME: quality_dashboard
+        DB_SECRET_ARN: !Ref DbSecret
+        DB_SSL: require
+        DATA_LAKE_BUCKET: !Ref DataLakeBucket
+        SSM_CONFIG_PREFIX: !Sub '/${NamePrefix}/config'
+        LOG_LEVEL: info
+
+Resources:
+
+  ##############################################################################
+  # Storage & CDN
+  ##############################################################################
+
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${NamePrefix}-datalake'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawAfter180Days
+            Status: Enabled
+            Prefix: raw/
+            ExpirationInDays: 180
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${NamePrefix}-frontend'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${NamePrefix}-frontend-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CdnDistribution}'
+
+  CdnDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: frontend-origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOAC
+            S3OriginConfig: { OriginAccessIdentity: '' }
+        DefaultCacheBehavior:
+          TargetOriginId: frontend-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  ##############################################################################
+  # Auth
+  ##############################################################################
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${NamePrefix}-userpool'
+      MfaConfiguration: OFF
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  ViewerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: Viewer }
+
+  ReleaseManagerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: ReleaseManager }
+
+  QALeadGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: QALead }
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${NamePrefix}-spa-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  ##############################################################################
+  # API
+  ##############################################################################
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${NamePrefix}-api'
+      StageName: Prod
+      TracingEnabled: true
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowMethods: "'GET,POST,PUT,OPTIONS'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiProdStage
+    Properties:
+      Name: !Sub '${NamePrefix}-cicd-key'
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref Api
+          StageName: Prod
+
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiProdStage
+    Properties:
+      UsagePlanName: !Sub '${NamePrefix}-cicd-usage-plan'
+      ApiStages:
+        - ApiId: !Ref Api
+          Stage: Prod
+
+  ApiUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+  ##############################################################################
+  # Ingestion Lambdas (API pull)
+  ##############################################################################
+
+  IngestApiSonarqubeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-ingest-api-sonarqube'
+      Handler: handlers/ingest-api-sonarqube.handler
+      Role: !GetAtt IngestApiRole.Arn
+      Environment:
+        Variables:
+          TOOL: sonarqube
+          TOOL_SECRET_ARN: !Ref SonarqubeSecret
+          INGEST_QUEUE_URL: !Ref IngestQueue
+  IngestApiSonarqubeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/ingest-api-sonarqube', RetentionInDays: 30 }
+
+  IngestApiGitlabFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-ingest-api-gitlab'
+      Handler: handlers/ingest-api-gitlab.handler
+      Role: !GetAtt IngestApiRole.Arn
+      Environment:
+        Variables:
+          TOOL: gitlab
+          TOOL_SECRET_ARN: !Ref GitlabSecret
+          INGEST_QUEUE_URL: !Ref IngestQueue
+  IngestApiGitlabLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/ingest-api-gitlab', RetentionInDays: 30 }
+
+  ##############################################################################
+  # Ingestion Lambdas (SFTP pull)
+  ##############################################################################
+
+  IngestSftpFortifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-ingest-sftp-fortify'
+      Handler: handlers/ingest-sftp-fortify.handler
+      Role: !GetAtt IngestSftpRole.Arn
+      Environment:
+        Variables:
+          TOOL: fortify
+          TOOL_SECRET_ARN: !Ref FortifySecret
+          INGEST_QUEUE_URL: !Ref IngestQueue
+  IngestSftpFortifyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/ingest-sftp-fortify', RetentionInDays: 30 }
+
+  IngestSftpTrivyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-ingest-sftp-trivy'
+      Handler: handlers/ingest-sftp-trivy.handler
+      Role: !GetAtt IngestSftpRole.Arn
+      Environment:
+        Variables:
+          TOOL: trivy
+          TOOL_SECRET_ARN: !Ref TrivySecret
+          INGEST_QUEUE_URL: !Ref IngestQueue
+  IngestSftpTrivyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/ingest-sftp-trivy', RetentionInDays: 30 }
+
+  IngestSftpTricentisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-ingest-sftp-tricentis'
+      Handler: handlers/ingest-sftp-tricentis.handler
+      Role: !GetAtt IngestSftpRole.Arn
+      Environment:
+        Variables:
+          TOOL: tricentis
+          TOOL_SECRET_ARN: !Ref TricentisSecret
+          INGEST_QUEUE_URL: !Ref IngestQueue
+  IngestSftpTricentisLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/ingest-sftp-tricentis', RetentionInDays: 30 }
+
+  ##############################################################################
+  # Normalisation Lambdas (SQS-triggered)
+  ##############################################################################
+
+  NormalizeSonarqubeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-normalize-sonarqube'
+      Handler: handlers/normalize-sonarqube.handler
+      Role: !GetAtt NormalizeRole.Arn
+      Environment: { Variables: { TOOL: sonarqube } }
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 5
+            FilterCriteria: { Filters: [{ Pattern: '{"body":{"tool":["sonarqube"]}}' }] }
+  NormalizeSonarqubeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/normalize-sonarqube', RetentionInDays: 30 }
+
+  NormalizeGitlabFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-normalize-gitlab'
+      Handler: handlers/normalize-gitlab.handler
+      Role: !GetAtt NormalizeRole.Arn
+      Environment: { Variables: { TOOL: gitlab } }
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 5
+            FilterCriteria: { Filters: [{ Pattern: '{"body":{"tool":["gitlab"]}}' }] }
+  NormalizeGitlabLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/normalize-gitlab', RetentionInDays: 30 }
+
+  NormalizeFortifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-normalize-fortify'
+      Handler: handlers/normalize-fortify.handler
+      Role: !GetAtt NormalizeRole.Arn
+      Environment: { Variables: { TOOL: fortify } }
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 5
+            FilterCriteria: { Filters: [{ Pattern: '{"body":{"tool":["fortify"]}}' }] }
+  NormalizeFortifyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/normalize-fortify', RetentionInDays: 30 }
+
+  NormalizeTrivyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-normalize-trivy'
+      Handler: handlers/normalize-trivy.handler
+      Role: !GetAtt NormalizeRole.Arn
+      Environment: { Variables: { TOOL: trivy } }
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 5
+            FilterCriteria: { Filters: [{ Pattern: '{"body":{"tool":["trivy"]}}' }] }
+  NormalizeTrivyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/normalize-trivy', RetentionInDays: 30 }
+
+  NormalizeTricentisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-normalize-tricentis'
+      Handler: handlers/normalize-tricentis.handler
+      Role: !GetAtt NormalizeRole.Arn
+      Environment: { Variables: { TOOL: tricentis } }
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 5
+            FilterCriteria: { Filters: [{ Pattern: '{"body":{"tool":["tricentis"]}}' }] }
+  NormalizeTricentisLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/normalize-tricentis', RetentionInDays: 30 }
+
+  ##############################################################################
+  # Gate evaluation & notification
+  ##############################################################################
+
+  GateEvalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-gate-eval'
+      Handler: handlers/gate-eval.handler
+      Role: !GetAtt GateEvalRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+          APP_URL: !Sub 'https://${CdnDistribution.DomainName}'
+  GateEvalLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/gate-eval', RetentionInDays: 30 }
+
+  NotifySlackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-notify-slack'
+      Handler: handlers/notify-slack.handler
+      Role: !GetAtt NotifySlackRole.Arn
+      Environment:
+        Variables:
+          SLACK_SECRET_ARN: !Ref SlackSecret
+      Events:
+        AlertTopic:
+          Type: SNS
+          Properties: { Topic: !Ref AlertsTopic }
+  NotifySlackLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/notify-slack', RetentionInDays: 30 }
+
+  ##############################################################################
+  # API handler Lambdas
+  ##############################################################################
+
+  ApiProjectsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-api-projects'
+      Handler: handlers/api-projects.handler
+      Role: !GetAtt ApiHandlerRole.Arn
+      Events:
+        ListProjects: { Type: Api, Properties: { RestApiId: !Ref Api, Path: /projects, Method: GET } }
+        ProjectDashboard: { Type: Api, Properties: { RestApiId: !Ref Api, Path: '/projects/{id}/dashboard', Method: GET } }
+  ApiProjectsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/api-projects', RetentionInDays: 30 }
+
+  ApiPortfolioFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-api-portfolio'
+      Handler: handlers/api-portfolio.handler
+      Role: !GetAtt ApiHandlerRole.Arn
+      Events:
+        PortfolioSummary: { Type: Api, Properties: { RestApiId: !Ref Api, Path: /portfolio/summary, Method: GET } }
+  ApiPortfolioLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/api-portfolio', RetentionInDays: 30 }
+
+  ApiFindingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-api-findings'
+      Handler: handlers/api-findings.handler
+      Role: !GetAtt ApiHandlerRole.Arn
+      Events:
+        ListFindings: { Type: Api, Properties: { RestApiId: !Ref Api, Path: /findings, Method: GET } }
+  ApiFindingsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/api-findings', RetentionInDays: 30 }
+
+  ApiReleasesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-api-releases'
+      Handler: handlers/api-releases.handler
+      Role: !GetAtt ApiHandlerRole.Arn
+      Events:
+        GateStatus: { Type: Api, Properties: { RestApiId: !Ref Api, Path: '/releases/{id}/gate-status', Method: GET } }
+        GateCheck:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /releases/{id}/gate-check
+            Method: GET
+            Auth: { Authorizer: NONE, ApiKeyRequired: true }
+  ApiReleasesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/api-releases', RetentionInDays: 30 }
+
+  ApiThresholdsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-api-thresholds'
+      Handler: handlers/api-thresholds.handler
+      Role: !GetAtt ApiHandlerRole.Arn
+      Environment: { Variables: { REQUIRED_GROUPS: 'ReleaseManager,QALead' } }
+      Events:
+        PutThreshold: { Type: Api, Properties: { RestApiId: !Ref Api, Path: '/projects/{id}/thresholds', Method: PUT } }
+  ApiThresholdsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/api-thresholds', RetentionInDays: 30 }
+
+  ApiNotificationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-api-notifications'
+      Handler: handlers/api-notifications.handler
+      Role: !GetAtt ApiHandlerRole.Arn
+      Environment: { Variables: { ALERTS_TOPIC_ARN: !Ref AlertsTopic } }
+      Events:
+        Subscribe: { Type: Api, Properties: { RestApiId: !Ref Api, Path: /notifications/subscriptions, Method: POST } }
+  ApiNotificationsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub '/${NamePrefix}/api-notifications', RetentionInDays: 30 }
+
+  ##############################################################################
+  # Messaging: SQS + DLQ, SNS
+  ##############################################################################
+
+  IngestDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${NamePrefix}-ingest-dlq'
+      MessageRetentionPeriod: 1209600
+
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${NamePrefix}-ingest-queue'
+      VisibilityTimeout: 120
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDlq.Arn
+        maxReceiveCount: 3
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${NamePrefix}-alerts'
+
+  OpsAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${NamePrefix}-ops-alerts'
+
+  ##############################################################################
+  # RDS (MySQL, db.t3.micro, public - no NAT Gateway in this account)
+  ##############################################################################
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${NamePrefix}-db-credentials'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"qdadmin"}'
+        GenerateStringKey: password
+        ExcludeCharacters: '"@/\'
+        PasswordLength: 24
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${NamePrefix}-db-sg'
+      GroupDescription: MySQL access for non-VPC Lambdas (no NAT Gateway available in this account)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${NamePrefix}-db-subnet-group'
+      DBSubnetGroupDescription: Existing account public subnets (no NAT Gateway)
+      SubnetIds: !Ref PublicSubnetIds
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub '${NamePrefix}-db-params'
+      Family: mysql8.0
+      Parameters:
+        require_secure_transport: '1'
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${NamePrefix}-db'
+      Engine: mysql
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: '20'
+      DBName: quality_dashboard
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DBParameterGroupName: !Ref DbParameterGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: true
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+
+  ##############################################################################
+  # Step Functions + EventBridge
+  ##############################################################################
+
+  NightlyPipeline:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub '${NamePrefix}-nightly-pipeline'
+      Role: !GetAtt StepFunctionsRole.Arn
+      Definition:
+        StartAt: InvokeIngestion
+        States:
+          InvokeIngestion:
+            Type: Parallel
+            Catch: [{ ErrorEquals: ['States.ALL'], Next: PipelineFailed }]
+            Next: WaitForNormalization
+            Branches:
+              - StartAt: Sonarqube
+                States: { Sonarqube: { Type: Task, Resource: !GetAtt IngestApiSonarqubeFunction.Arn, End: true } }
+              - StartAt: Gitlab
+                States: { Gitlab: { Type: Task, Resource: !GetAtt IngestApiGitlabFunction.Arn, End: true } }
+              - StartAt: Fortify
+                States: { Fortify: { Type: Task, Resource: !GetAtt IngestSftpFortifyFunction.Arn, End: true } }
+              - StartAt: Trivy
+                States: { Trivy: { Type: Task, Resource: !GetAtt IngestSftpTrivyFunction.Arn, End: true } }
+              - StartAt: Tricentis
+                States: { Tricentis: { Type: Task, Resource: !GetAtt IngestSftpTricentisFunction.Arn, End: true } }
+          WaitForNormalization:
+            Type: Wait
+            Seconds: 300
+            Next: EvaluateGates
+          EvaluateGates:
+            Type: Task
+            Resource: !GetAtt GateEvalFunction.Arn
+            Catch: [{ ErrorEquals: ['States.ALL'], Next: PipelineFailed }]
+            Next: PipelineSucceeded
+          PipelineSucceeded:
+            Type: Succeed
+          PipelineFailed:
+            Type: Fail
+
+  NightlyTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-nightly-trigger-role'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartPipelineExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref NightlyPipeline
+
+  NightlyTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${NamePrefix}-nightly-trigger'
+      ScheduleExpression: cron(0 18 * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: NightlyPipelineTarget
+          Arn: !Ref NightlyPipeline
+          RoleArn: !GetAtt NightlyTriggerRole.Arn
+
+  ##############################################################################
+  # Secrets
+  ##############################################################################
+
+  SonarqubeSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: { Name: !Sub '${NamePrefix}-sonarqube-credentials', SecretString: '{"token":"REPLACE_ME","baseUrl":"REPLACE_ME"}' }
+
+  GitlabSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: { Name: !Sub '${NamePrefix}-gitlab-credentials', SecretString: '{"token":"REPLACE_ME","baseUrl":"REPLACE_ME"}' }
+
+  FortifySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: { Name: !Sub '${NamePrefix}-fortify-sftp-credentials', SecretString: '{"host":"REPLACE_ME","username":"REPLACE_ME","privateKey":"REPLACE_ME"}' }
+
+  TrivySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: { Name: !Sub '${NamePrefix}-trivy-sftp-credentials', SecretString: '{"host":"REPLACE_ME","username":"REPLACE_ME","privateKey":"REPLACE_ME"}' }
+
+  TricentisSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: { Name: !Sub '${NamePrefix}-tricentis-sftp-credentials', SecretString: '{"host":"REPLACE_ME","username":"REPLACE_ME","privateKey":"REPLACE_ME"}' }
+
+  SlackSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: { Name: !Sub '${NamePrefix}-slack-webhook', SecretString: '{"webhookUrl":"REPLACE_ME"}' }
+
+  ##############################################################################
+  # SSM configuration
+  ##############################################################################
+
+  SsmSonarqubeBaseUrl:
+    Type: AWS::SSM::Parameter
+    Properties: { Name: !Sub '/${NamePrefix}/config/sonarqube-base-url', Type: String, Value: 'REPLACE_ME' }
+  SsmGitlabBaseUrl:
+    Type: AWS::SSM::Parameter
+    Properties: { Name: !Sub '/${NamePrefix}/config/gitlab-base-url', Type: String, Value: 'REPLACE_ME' }
+  SsmFortifySftpHost:
+    Type: AWS::SSM::Parameter
+    Properties: { Name: !Sub '/${NamePrefix}/config/fortify-sftp-host', Type: String, Value: 'REPLACE_ME' }
+  SsmTrivySftpHost:
+    Type: AWS::SSM::Parameter
+    Properties: { Name: !Sub '/${NamePrefix}/config/trivy-sftp-host', Type: String, Value: 'REPLACE_ME' }
+  SsmTricentisSftpHost:
+    Type: AWS::SSM::Parameter
+    Properties: { Name: !Sub '/${NamePrefix}/config/tricentis-sftp-host', Type: String, Value: 'REPLACE_ME' }
+  SsmPipelineSlaMinutes:
+    Type: AWS::SSM::Parameter
+    Properties: { Name: !Sub '/${NamePrefix}/config/pipeline-sla-minutes', Type: String, Value: '180' }
+  SsmDefaultGateOperator:
+    Type: AWS::SSM::Parameter
+    Properties: { Name: !Sub '/${NamePrefix}/config/default-gate-operator', Type: String, Value: 'gte' }
+
+  ##############################################################################
+  # CloudWatch alarms
+  ##############################################################################
+
+  PipelineFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-pipeline-failed'
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions: [{ Name: StateMachineArn, Value: !Ref NightlyPipeline }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+  GateEvalErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-gate-eval-errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref GateEvalFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+  IngestDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-ingest-dlq-not-empty'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt IngestDlq.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-api-5xx'
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions: [{ Name: ApiName, Value: !Sub '${NamePrefix}-api' }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertsTopic]
+
+  ##############################################################################
+  # IAM roles
+  ##############################################################################
+
+  IngestApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-ingest-api-role'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: IngestApiAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${DataLakeBucket.Arn}/raw/*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref SonarqubeSecret, !Ref GitlabSecret]
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/config/*'
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt IngestQueue.Arn
+              - Effect: Allow
+                Action: xray:PutTraceSegments
+                Resource: '*'
+
+  IngestSftpRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-ingest-sftp-role'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: IngestSftpAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${DataLakeBucket.Arn}/raw/*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref FortifySecret, !Ref TrivySecret, !Ref TricentisSecret]
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/config/*'
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt IngestQueue.Arn
+              - Effect: Allow
+                Action: xray:PutTraceSegments
+                Resource: '*'
+
+  NormalizeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-normalize-role'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: NormalizeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${DataLakeBucket.Arn}/raw/*'
+              - Effect: Allow
+                # rds-db:connect is granted for completeness; it is a no-op here since
+                # IAM DB authentication is not enabled -- auth is via the Secrets
+                # Manager credentials below, which is what mysql2 actually uses.
+                Action: [rds-db:connect, secretsmanager:GetSecretValue]
+                Resource: [!GetAtt DbInstance.DBInstanceArn, !Ref DbSecret]
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt IngestQueue.Arn
+              - Effect: Allow
+                Action: xray:PutTraceSegments
+                Resource: '*'
+
+  GateEvalRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-gate-eval-role'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: GateEvalAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [rds-db:connect, secretsmanager:GetSecretValue]
+                Resource: [!GetAtt DbInstance.DBInstanceArn, !Ref DbSecret]
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopic
+              - Effect: Allow
+                Action: xray:PutTraceSegments
+                Resource: '*'
+
+  NotifySlackRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-notify-slack-role'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: NotifySlackAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SlackSecret
+              - Effect: Allow
+                Action: xray:PutTraceSegments
+                Resource: '*'
+
+  ApiHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-api-handler-role'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: ApiHandlerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [rds-db:connect, secretsmanager:GetSecretValue]
+                Resource: [!GetAtt DbInstance.DBInstanceArn, !Ref DbSecret]
+              - Effect: Allow
+                Action: sns:Subscribe
+                Resource: !Ref AlertsTopic
+              - Effect: Allow
+                Action: xray:PutTraceSegments
+                Resource: '*'
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-stepfunctions-role'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: states.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: InvokePipelineLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt IngestApiSonarqubeFunction.Arn
+                  - !GetAtt IngestApiGitlabFunction.Arn
+                  - !GetAtt IngestSftpFortifyFunction.Arn
+                  - !GetAtt IngestSftpTrivyFunction.Arn
+                  - !GetAtt IngestSftpTricentisFunction.Arn
+                  - !GetAtt GateEvalFunction.Arn
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/Prod'
+  AppUrl:
+    Value: !Sub 'https://${CdnDistribution.DomainName}'
+  CdnDistributionId:
+    Value: !Ref CdnDistribution
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  DataLakeBucketName:
+    Value: !Ref DataLakeBucket
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  DbEndpoint:
+    Value: !GetAtt DbInstance.Endpoint.Address
+  DbSecretArn:
+    Value: !Ref DbSecret
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
+  StateMachineArn:
+    Value: !Ref NightlyPipeline
+  ApiKeyId:
+    Value: !Ref ApiKey

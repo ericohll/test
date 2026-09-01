@@ -1,0 +1,88 @@
+/*
+ * Design tokens — the ONLY place any colour/space/radius/shadow/font value is
+ * declared. Every other stylesheet (app.css) and every component must
+ * reference these via var(--qd-*) / var(--sp-*). See frontend/README.md for
+ * the restated token table.
+ */
+:root {
+  /* Font stacks */
+  --qd-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --qd-font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Type scale (px) */
+  --qd-fs-caption: 12px;
+  --qd-fs-small: 13px;
+  --qd-fs-body: 14px;
+  --qd-fs-section: 16px;
+  --qd-fs-page: 20px;
+  --qd-fs-kpi: 28px;
+
+  --qd-fw-regular: 400;
+  --qd-fw-medium: 500;
+  --qd-fw-semibold: 600;
+  --qd-fw-bold: 700;
+
+  --qd-lh-body: 1.45;
+  --qd-lh-heading: 1.2;
+  --qd-ls-caps: 0.04em;
+
+  /* Spacing scale */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+
+  /* Radius */
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 8px;
+  --radius-pill: 999px;
+
+  /* Shadows */
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-2: 0 8px 24px rgba(15, 23, 42, 0.18);
+
+  /* Neutrals + accent */
+  --qd-bg: #f5f7fa;
+  --qd-surface: #ffffff;
+  --qd-surface-alt: #f0f3f7;
+  --qd-border: #d8dee8;
+  --qd-border-strong: #b9c2d0;
+  --qd-text: #0f172a;
+  --qd-text-muted: #5b6779;
+  --qd-text-faint: #8a94a6;
+  --qd-accent: #1f5fd6;
+  --qd-accent-hover: #1a4fb4;
+  --qd-accent-soft: #e8f0fe;
+  --qd-sidebar-bg: #0f172a;
+  --qd-sidebar-text: #c6cede;
+  --qd-sidebar-active-bg: #1b2740;
+  --qd-on-dark: #ffffff;
+  --qd-on-accent: #ffffff;
+
+  /* Gate status: fg / bg / border */
+  --qd-status-pass-fg: #1a7f4b;
+  --qd-status-pass-bg: #e6f5ec;
+  --qd-status-pass-border: #9ad3b0;
+  --qd-status-fail-fg: #c0263c;
+  --qd-status-fail-bg: #fdeaed;
+  --qd-status-fail-border: #f0b3bd;
+  --qd-status-unknown-fg: #5b6779;
+  --qd-status-unknown-bg: #eef0f3;
+  --qd-status-unknown-border: #cfd5de;
+
+  /* Severity: fg / bg */
+  --qd-severity-critical-fg: #7f1226;
+  --qd-severity-critical-bg: #fbe4e8;
+  --qd-severity-high-fg: #c0263c;
+  --qd-severity-high-bg: #fdeaed;
+  --qd-severity-medium-fg: #b06a00;
+  --qd-severity-medium-bg: #fdf1dd;
+  --qd-severity-low-fg: #1f5fd6;
+  --qd-severity-low-bg: #e8f0fe;
+  --qd-severity-info-fg: #5b6779;
+  --qd-severity-info-bg: #eef0f3;
+}

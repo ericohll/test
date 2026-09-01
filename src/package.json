@@ -1,0 +1,16 @@
+{
+  "name": "quality-dashboard-lambda",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Quality Dashboard - Lambda runtime dependencies (bundled per-function by sam build via CodeUri: src/)",
+  "type": "commonjs",
+  "dependencies": {
+    "mysql2": "^3.11.0",
+    "ssh2-sftp-client": "^11.0.0",
+    "@aws-sdk/client-s3": "^3.650.0",
+    "@aws-sdk/client-secrets-manager": "^3.650.0",
+    "@aws-sdk/client-sqs": "^3.650.0",
+    "@aws-sdk/client-sns": "^3.650.0",
+    "@aws-sdk/client-ssm": "^3.650.0"
+  }
+}

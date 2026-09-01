@@ -1,0 +1,64 @@
+{
+  "envelope_version": 1,
+  "tool": "trivy",
+  "project_id": "payments-api",
+  "run_date": "2026-09-01",
+  "fetched_at": "2026-09-01T02:00:00.000Z",
+  "source": { "host": "sftp.example.com", "remotePath": "/exports/payments-api/trivy.json" },
+  "payload": {
+    "SchemaVersion": 2,
+    "ArtifactName": "payments-api:latest",
+    "Results": [
+      {
+        "Target": "payments-api:latest (alpine 3.19)",
+        "Class": "os-pkgs",
+        "Type": "alpine",
+        "Vulnerabilities": [
+          {
+            "VulnerabilityID": "CVE-2026-0001",
+            "PkgName": "openssl",
+            "InstalledVersion": "3.1.0",
+            "FixedVersion": "3.1.1",
+            "Severity": "CRITICAL",
+            "Title": "OpenSSL buffer overflow",
+            "PrimaryURL": "https://example.com/CVE-2026-0001"
+          },
+          {
+            "VulnerabilityID": "CVE-2026-0002",
+            "PkgName": "libcurl",
+            "InstalledVersion": "8.0.0",
+            "FixedVersion": "",
+            "Severity": "MEDIUM",
+            "Title": "libcurl info leak",
+            "PrimaryURL": "https://example.com/CVE-2026-0002"
+          }
+        ]
+      },
+      {
+        "Target": "payments-api:latest (node-pkgs)",
+        "Class": "lang-pkgs",
+        "Type": "node-pkgs",
+        "Vulnerabilities": [
+          {
+            "VulnerabilityID": "CVE-2026-0003",
+            "PkgName": "lodash",
+            "InstalledVersion": "4.17.0",
+            "FixedVersion": "4.17.21",
+            "Severity": "HIGH",
+            "Title": "",
+            "PrimaryURL": "https://example.com/CVE-2026-0003"
+          },
+          {
+            "VulnerabilityID": "CVE-2026-0004",
+            "PkgName": "weird-pkg",
+            "InstalledVersion": "1.0.0",
+            "FixedVersion": "",
+            "Severity": "UNKNOWN",
+            "Title": "Unclassified issue",
+            "PrimaryURL": "https://example.com/CVE-2026-0004"
+          }
+        ]
+      }
+    ]
+  }
+}

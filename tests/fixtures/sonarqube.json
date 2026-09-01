@@ -1,0 +1,57 @@
+{
+  "envelope_version": 1,
+  "tool": "sonarqube",
+  "project_id": "checkout-svc",
+  "run_date": "2026-09-01",
+  "fetched_at": "2026-09-01T02:00:00.000Z",
+  "source": { "baseUrl": "https://sonar.example.com", "sonarProjectKey": "checkout-svc" },
+  "payload": {
+    "measures": {
+      "component": {
+        "key": "checkout-svc",
+        "measures": [
+          { "metric": "coverage", "value": "78.4" },
+          { "metric": "duplicated_lines_density", "value": "3.2" },
+          { "metric": "bugs", "value": "4" },
+          { "metric": "code_smells", "value": "57" },
+          { "metric": "sqale_index", "value": "612" }
+        ]
+      }
+    },
+    "issues": [
+      {
+        "key": "ISSUE-1",
+        "rule": "java:S1234",
+        "severity": "BLOCKER",
+        "status": "OPEN",
+        "message": "Null pointer dereference",
+        "component": "checkout-svc:src/Foo.java"
+      },
+      {
+        "key": "ISSUE-2",
+        "rule": "java:S5678",
+        "severity": "MAJOR",
+        "status": "CONFIRMED",
+        "message": "Cyclomatic complexity too high",
+        "component": "checkout-svc:src/Bar.java"
+      },
+      {
+        "key": "ISSUE-3",
+        "rule": "java:S9012",
+        "severity": "MINOR",
+        "status": "RESOLVED",
+        "resolution": "FALSE-POSITIVE",
+        "message": "Unused variable",
+        "component": "checkout-svc:src/Baz.java"
+      },
+      {
+        "key": "ISSUE-4",
+        "rule": "java:S3456",
+        "severity": "WEIRD_UNKNOWN",
+        "status": "CLOSED",
+        "message": "Some closed issue",
+        "component": "checkout-svc:src/Qux.java"
+      }
+    ]
+  }
+}

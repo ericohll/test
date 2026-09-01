@@ -1,0 +1,32 @@
+{
+  "envelope_version": 1,
+  "tool": "gitlab",
+  "project_id": "checkout-svc",
+  "run_date": "2026-09-01",
+  "fetched_at": "2026-09-01T02:00:00.000Z",
+  "source": { "baseUrl": "https://gitlab.example.com", "gitlabProjectId": 42 },
+  "payload": {
+    "project": {
+      "id": 42,
+      "name": "checkout-svc",
+      "path_with_namespace": "team/checkout-svc",
+      "web_url": "https://gitlab.example.com/team/checkout-svc"
+    },
+    "merge_requests": [
+      { "iid": 101, "title": "Add retry logic" },
+      { "iid": 102, "title": "Fix flaky test" }
+    ],
+    "pipelines": [
+      { "id": 9001, "status": "success" },
+      { "id": 9002, "status": "success" },
+      { "id": 9003, "status": "failed" },
+      { "id": 9004, "status": "failed" }
+    ],
+    "vulnerability_findings": [
+      { "id": 5001, "name": "SQL Injection", "severity": "critical", "state": "detected", "report_type": "sast" },
+      { "id": 5002, "name": "Outdated dependency", "severity": "high", "state": "confirmed", "report_type": "dependency_scanning" },
+      { "id": 5003, "name": "Weak crypto", "severity": "medium", "state": "dismissed", "report_type": "sast" },
+      { "id": 5004, "name": "Odd severity", "severity": "unknown", "state": "detected", "report_type": "sast" }
+    ]
+  }
+}
